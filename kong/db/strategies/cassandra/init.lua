@@ -3,7 +3,6 @@ local cjson = require "cjson"
 
 
 local fmt           = string.format
-local rep           = string.rep
 local insert        = table.insert
 local concat        = table.concat
 local setmetatable  = setmetatable
@@ -49,6 +48,10 @@ _mt.__index = _mt
 
 
 local function is_partitioned(self)
+  if self.partitioned ~= nil then
+    return self.partitioned
+  end
+
   local cql
 
   if self.connector.major_version == 3 then
@@ -77,7 +80,9 @@ local function is_partitioned(self)
     return rows[1] and rows[1].kind == "partition_key"
   end
 
-  return not not rows[1]
+  self.partitioned = not not rows[1]
+
+  return self.partitioned
 end
 
 
@@ -105,8 +110,6 @@ local function build_queries(self)
   end
   select_bind_args = concat(select_bind_args, " AND ")
 
-  local insert_bind_args = rep("?, ", n_fields):sub(1, -3)
-
   local partitioned, err = is_partitioned(self)
   if err then
     return nil, err
@@ -114,14 +117,6 @@ local function build_queries(self)
 
   if partitioned then
     return {
-      insert = fmt([[
-        INSERT INTO %s (partition, %s) VALUES ('%s', %s) IF NOT EXISTS
-      ]], schema.name, insert_columns, schema.name, insert_bind_args),
-
-      insert_ttl = fmt([[
-        INSERT INTO %s (partition, %s) VALUES ('%s', %s) IF NOT EXISTS USING TTL %s
-      ]], schema.name, insert_columns, schema.name, insert_bind_args, "%u"),
-
       select = fmt([[
         SELECT %s FROM %s WHERE partition = '%s' AND %s
       ]], insert_columns, schema.name, schema.name, select_bind_args),
@@ -157,14 +152,6 @@ local function build_queries(self)
   end
 
   return {
-    insert = fmt([[
-      INSERT INTO %s (%s) VALUES (%s) IF NOT EXISTS
-    ]], schema.name, insert_columns, insert_bind_args),
-
-    insert_ttl = fmt([[
-      INSERT INTO %s (%s) VALUES (%s) IF NOT EXISTS USING TTL %s
-    ]], schema.name, insert_columns, insert_bind_args, "%u"),
-
     -- might raise a "you must enable ALLOW FILTERING" error
     select = fmt([[
       SELECT %s FROM %s WHERE %s
@@ -519,44 +506,43 @@ function _mt:insert(entity, options)
   local args = new_tab(#schema.fields, 0)
   local ttl = schema.ttl and options and options.ttl
 
-  local cql, err
-  if ttl then
-    cql, err = get_query(self, "insert_ttl")
-    if err then
-      return nil, err
-    end
+  local partitioned, err = is_partitioned(self)
+  if err then
+    return nil, err
+  end
 
-    cql = fmt(cql, ttl)
+  local cols = {}
+  local binds = {}
 
-  else
-    cql, err = get_query(self, "insert")
-    if err then
-      return nil, err
-    end
+  if partitioned then
+    insert(cols, "partition")
+    insert(binds, "?")
+    insert(args, schema.name)
   end
 
   -- serialize VALUES clause args
 
   for field_name, field in schema:each_field() do
-    if field.type == "foreign" then
-      local foreign_pk = entity[field_name]
+    local value = entity[field_name]
+    if value == ngx.null or value == nil then
+      goto continue
+    end
 
-      if foreign_pk ~= ngx.null then
-        -- if given, check if this foreign entity exists
-        local exists, err_t = foreign_pk_exists(self, field_name, field, foreign_pk)
-        if not exists then
-          return nil, err_t
-        end
+    if field.type == "foreign" then
+      -- if given, check if this foreign entity exists
+      local exists, err_t = foreign_pk_exists(self, field_name, field, value)
+      if not exists then
+        return nil, err_t
       end
 
       local db_columns = self.foreign_keys_db_columns[field_name]
-      serialize_foreign_pk(db_columns, args, nil, foreign_pk)
+      serialize_foreign_pk(db_columns, args, cols, value)
+      for _ = 1, #db_columns do
+        insert(binds, "?")
+      end
 
     else
-      if field.unique
-        and entity[field_name] ~= ngx.null
-        and entity[field_name] ~= nil
-      then
+      if field.unique then
         -- a UNIQUE constaint is set on this field.
         -- We unfortunately follow a read-before-write pattern in this case,
         -- but this is made necessary for Kong to behave in a database-agnostic
@@ -575,8 +561,18 @@ function _mt:insert(entity, options)
       end
 
       insert(args, serialize_arg(field, entity[field_name]))
+      insert(cols, field_name)
+      insert(binds, "?")
     end
+
+    ::continue::
   end
+
+  local cql = fmt("INSERT INTO %s(%s) VALUES(%s)%s",
+                  schema.name,
+                  concat(cols, ", "),
+                  concat(binds, ", "),
+                  ttl and fmt(" USING TTL %d", ttl) or "")
 
   -- execute query
 
